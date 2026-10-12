@@ -30,6 +30,11 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+// processOutputDrainTimeout bounds how long a spawned process's exit is held
+// back while its output readers drain the pipes. A child the process started
+// in the background can keep the pipes open after the process itself exits.
+const processOutputDrainTimeout = 2 * time.Second
+
 type processHandle struct {
 	id       openapi_types.UUID
 	pid      int
@@ -298,19 +303,12 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 		stdin = ptyFile
 		isTTY = true
 	} else {
-		stdout, err = cmd.StdoutPipe()
-		if err != nil {
-			return oapi.ProcessSpawn500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: "failed to open stdout"}}, nil
-		}
-		stderr, err = cmd.StderrPipe()
-		if err != nil {
-			return oapi.ProcessSpawn500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: "failed to open stderr"}}, nil
-		}
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
 			return oapi.ProcessSpawn500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: "failed to open stdin"}}, nil
 		}
-		if err := cmd.Start(); err != nil {
+		stdout, stderr, err = startWithOutputPipes(cmd)
+		if err != nil {
 			if isUserCmdError(err) {
 				return oapi.ProcessSpawn400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: err.Error()}}, nil
 			}
@@ -354,8 +352,11 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 	// Reader goroutines
 	// In PTY mode, do NOT read from the PTY here to avoid competing with the /attach endpoint.
 	// In non‑PTY mode, stdout and stderr are separate pipes, so we run two readers and tag chunks accordingly.
+	var readers sync.WaitGroup
 	if !isTTY {
+		readers.Add(2)
 		go func() {
+			defer readers.Done()
 			reader := bufio.NewReader(stdout)
 			buf := make([]byte, 4096)
 			for {
@@ -371,6 +372,7 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 			}
 		}()
 		go func() {
+			defer readers.Done()
 			reader := bufio.NewReader(stderr)
 			buf := make([]byte, 4096)
 			for {
@@ -405,6 +407,17 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 			}
 		}
 		h.setExited(code)
+		// Let the readers drain what the process wrote before it exited, so
+		// the exit event follows all of its output.
+		readersDone := make(chan struct{})
+		go func() {
+			readers.Wait()
+			close(readersDone)
+		}()
+		select {
+		case <-readersDone:
+		case <-time.After(processOutputDrainTimeout):
+		}
 		// Ensure all related FDs are closed to avoid leaking descriptors.
 		// In PTY mode, close the PTY master; in non-PTY mode, close individual pipes.
 		if h.isTTY {
@@ -431,6 +444,11 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 			}
 		}
 
+		// Closing the pipes above ends any reader still reading them. A reader
+		// blocked on a full outCh finishes once a stream takes its event, just
+		// as the exit event below would have waited for one.
+		<-readersDone
+
 		// Send exit event
 		evt := oapi.ProcessStreamEventEvent("exit")
 		h.outCh <- oapi.ProcessStreamEvent{Event: &evt, ExitCode: &code}
@@ -455,6 +473,36 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 		Pid:       &pid,
 		StartedAt: &startedAt,
 	}, nil
+}
+
+// startWithOutputPipes starts cmd with stdout and stderr connected to pipes
+// whose read ends the caller owns and must close. cmd.StdoutPipe is not used
+// because cmd.Wait closes its read end as soon as the process exits, which
+// discards output the readers have not consumed yet.
+func startWithOutputPipes(cmd *exec.Cmd) (stdout, stderr *os.File, err error) {
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		return nil, nil, err
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	err = cmd.Start()
+	// The child holds its own copies of the write ends; closing ours lets the
+	// readers see EOF once the child, and anything it started, closes them.
+	stdoutW.Close()
+	stderrW.Close()
+	if err != nil {
+		stdoutR.Close()
+		stderrR.Close()
+		return nil, nil, err
+	}
+	return stdoutR, stderrR, nil
 }
 
 // Send signal to process
@@ -581,27 +629,42 @@ func (s *ApiService) ProcessStdoutStream(ctx context.Context, request oapi.Proce
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
+		// writeEvent writes evt as an SSE frame: data: <json>\n\n
+		writeEvent := func(evt oapi.ProcessStreamEvent) error {
+			var buf bytes.Buffer
+			if err := json.NewEncoder(&buf).Encode(evt); err != nil {
+				log.Error("failed to marshal event", "err", err)
+				return err
+			}
+			line := bytes.TrimRight(buf.Bytes(), "\n")
+			if _, err := pw.Write([]byte("data: ")); err != nil {
+				return err
+			}
+			if _, err := pw.Write(line); err != nil {
+				return err
+			}
+			_, err := pw.Write([]byte("\n\n"))
+			return err
+		}
 		for {
 			select {
 			case evt := <-h.outCh:
-				// Write SSE: data: <json>\n\n
-				var buf bytes.Buffer
-				if err := json.NewEncoder(&buf).Encode(evt); err != nil {
-					log.Error("failed to marshal event", "err", err)
-					return
-				}
-				line := bytes.TrimRight(buf.Bytes(), "\n")
-				if _, err := pw.Write([]byte("data: ")); err != nil {
-					return
-				}
-				if _, err := pw.Write(line); err != nil {
-					return
-				}
-				if _, err := pw.Write([]byte("\n\n")); err != nil {
+				if writeEvent(evt) != nil {
 					return
 				}
 			case <-h.doneCh:
-				return
+				// The exit event and any output before it were queued before
+				// doneCh closed; deliver them before ending the stream.
+				for {
+					select {
+					case evt := <-h.outCh:
+						if writeEvent(evt) != nil {
+							return
+						}
+					default:
+						return
+					}
+				}
 			}
 		}
 	}()

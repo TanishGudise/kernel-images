@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -270,4 +271,139 @@ func TestBuildCmd_AsRootAndAsUserConflict(t *testing.T) {
 	body := &oapi.ProcessExecRequest{Command: "true", AsRoot: &asRoot, AsUser: &asUser}
 	_, err := buildCmd(body)
 	require.Error(t, err, "expected error when both as_root and as_user are set")
+}
+
+// spawnShForTest spawns `sh -c script` and returns its process ID.
+func spawnShForTest(t *testing.T, svc *ApiService, script string) openapi_types.UUID {
+	t.Helper()
+	args := []string{"-c", script}
+	resp, err := svc.ProcessSpawn(context.Background(), oapi.ProcessSpawnRequestObject{Body: &oapi.ProcessSpawnRequest{Command: "sh", Args: &args}})
+	require.NoError(t, err, "ProcessSpawn error")
+	s200, ok := resp.(oapi.ProcessSpawn200JSONResponse)
+	require.True(t, ok, "unexpected spawn resp type: %T", resp)
+	require.NotNil(t, s200.ProcessId, "missing ProcessId in spawn resp")
+	return *s200.ProcessId
+}
+
+// readProcessStream reads a process's SSE stream until it ends and returns
+// its stdout, its stderr and every event in the order received.
+func readProcessStream(t *testing.T, svc *ApiService, id openapi_types.UUID) (string, string, []oapi.ProcessStreamEvent) {
+	t.Helper()
+	resp, err := svc.ProcessStdoutStream(context.Background(), oapi.ProcessStdoutStreamRequestObject{ProcessId: id})
+	require.NoError(t, err, "StdoutStream error")
+	st200, ok := resp.(oapi.ProcessStdoutStream200TexteventStreamResponse)
+	require.True(t, ok, "unexpected stream resp: %T", resp)
+
+	type result struct {
+		stdout, stderr strings.Builder
+		events         []oapi.ProcessStreamEvent
+		err            error
+	}
+	done := make(chan *result, 1)
+	go func() {
+		r := &result{}
+		scanner := bufio.NewScanner(st200.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var evt oapi.ProcessStreamEvent
+			if r.err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &evt); r.err != nil {
+				break
+			}
+			r.events = append(r.events, evt)
+			if evt.DataB64 != nil {
+				b, _ := base64.StdEncoding.DecodeString(*evt.DataB64)
+				if evt.Stream != nil && *evt.Stream == "stderr" {
+					r.stderr.Write(b)
+				} else {
+					r.stdout.Write(b)
+				}
+			}
+		}
+		if r.err == nil {
+			r.err = scanner.Err()
+		}
+		done <- r
+	}()
+	select {
+	case r := <-done:
+		require.NoError(t, r.err, "read SSE stream")
+		return r.stdout.String(), r.stderr.String(), r.events
+	case <-time.After(10 * time.Second):
+		st200.Body.(io.Closer).Close()
+		t.Fatal("stream did not end within 10s")
+		return "", "", nil
+	}
+}
+
+// requireExitLast checks that the stream ended with exactly one exit event.
+func requireExitLast(t *testing.T, events []oapi.ProcessStreamEvent, wantCode int) {
+	t.Helper()
+	require.NotEmpty(t, events, "stream delivered no events")
+	last := events[len(events)-1]
+	require.True(t, last.Event != nil && *last.Event == "exit", "last event is not exit: %+v", last)
+	require.NotNil(t, last.ExitCode, "exit event has no exit code")
+	require.Equal(t, wantCode, *last.ExitCode, "exit code mismatch")
+	for _, evt := range events[:len(events)-1] {
+		require.Nil(t, evt.Event, "unexpected event before exit: %+v", evt)
+	}
+}
+
+func TestProcessStdoutStream_AfterExitDeliversQueuedEvents(t *testing.T) {
+	t.Parallel()
+	svc := &ApiService{procs: make(map[string]*processHandle), stz: scaletozero.NewNoopController()}
+
+	// Opening the stream only after the process has exited is the common case
+	// for short commands. Everything queued for it must still be delivered.
+	for i := 0; i < 200; i++ {
+		id := spawnShForTest(t, svc, "printf one; printf two 1>&2; exit 7")
+		svc.procMu.RLock()
+		h := svc.procs[id.String()]
+		svc.procMu.RUnlock()
+		<-h.doneCh
+
+		stdout, stderr, events := readProcessStream(t, svc, id)
+		require.Equal(t, "one", stdout, "run %d: stdout mismatch", i)
+		require.Equal(t, "two", stderr, "run %d: stderr mismatch", i)
+		requireExitLast(t, events, 7)
+	}
+}
+
+func TestProcessStdoutStream_DeliversAllOutputBeforeExit(t *testing.T) {
+	t.Parallel()
+	svc := &ApiService{procs: make(map[string]*processHandle), stz: scaletozero.NewNoopController()}
+
+	// The process exits right after writing more than a pipe buffer, so output
+	// is still unread in the pipe when it exits.
+	want := strings.Repeat("kernel\n", 50000)
+	for i := 0; i < 5; i++ {
+		id := spawnShForTest(t, svc, "yes kernel | head -n 50000; exit 3")
+		stdout, stderr, events := readProcessStream(t, svc, id)
+		require.Equal(t, len(want), len(stdout), "run %d: stdout length mismatch", i)
+		require.Equal(t, want, stdout, "run %d: stdout mismatch", i)
+		require.Empty(t, stderr, "run %d: unexpected stderr", i)
+		requireExitLast(t, events, 3)
+	}
+}
+
+func TestProcessSpawn_BackgroundChildDoesNotHoldExit(t *testing.T) {
+	t.Parallel()
+	svc := &ApiService{procs: make(map[string]*processHandle), stz: scaletozero.NewNoopController()}
+
+	// The shell exits at once, but the background sleep keeps the output
+	// pipes open. The stream must still end with the shell's exit.
+	id := spawnShForTest(t, svc, "sleep 30 & echo $!")
+	stdout, _, events := readProcessStream(t, svc, id)
+	pid, err := strconv.Atoi(strings.TrimSpace(stdout))
+	require.NoError(t, err, "background pid not printed: %q", stdout)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	requireExitLast(t, events, 0)
+
+	statusResp, err := svc.ProcessStatus(context.Background(), oapi.ProcessStatusRequestObject{ProcessId: id})
+	require.NoError(t, err, "ProcessStatus error")
+	sr, ok := statusResp.(oapi.ProcessStatus200JSONResponse)
+	require.True(t, ok, "unexpected status resp: %T", statusResp)
+	require.Equal(t, oapi.ProcessStatusState("exited"), *sr.State)
 }
